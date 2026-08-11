@@ -567,20 +567,13 @@ class Sam3Image(torch.nn.Module):
     def _run_encoder_refiner_lowres(
         self,
         cross_attended_encoder_features_72: torch.Tensor,
-        backbone_fpn: List[torch.Tensor],
         clip_image_feat_map: torch.Tensor,
         sam_text_mean: torch.Tensor,
         class_names: List[str],
     ) -> Dict[str, torch.Tensor]:
-        """Run Refiner at 36×36 on ALL classes simultaneously."""
-        if len(backbone_fpn) == 0:
-            raise ValueError("backbone_fpn must contain SAM3 FPN features.")
-
-        sam_fpn_72 = backbone_fpn[-1]
-
+        """Run the 36×36 Refiner on all classes simultaneously."""
         return self.encoder_refiner(
             encoder_features_72=cross_attended_encoder_features_72,
-            sam_fpn_72=sam_fpn_72,
             clip_image_feat_map=clip_image_feat_map,
             sam_text_mean=sam_text_mean,
             class_names=class_names,
@@ -600,7 +593,6 @@ class Sam3Image(torch.nn.Module):
         cross_attended_encoder_features_72 = encoder_refiner_cache[
             "cross_attended_encoder_features_72"
         ]
-        backbone_fpn = encoder_refiner_cache["backbone_fpn"]
         clip_image_feat_map = encoder_refiner_cache["clip_image_feat_map"]
         sam_text_mean = encoder_refiner_cache["sam_text_mean"]
 
@@ -612,8 +604,9 @@ class Sam3Image(torch.nn.Module):
             )
 
         refiner_out = self._run_encoder_refiner_lowres(
-            cross_attended_encoder_features_72=cross_attended_encoder_features_72,
-            backbone_fpn=backbone_fpn,
+            cross_attended_encoder_features_72=(
+                cross_attended_encoder_features_72
+            ),
             clip_image_feat_map=clip_image_feat_map,
             sam_text_mean=sam_text_mean,
             class_names=batch_class_names,

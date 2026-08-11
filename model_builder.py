@@ -241,8 +241,8 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
         _ = cls._resolve_openclip_pretrained(openclip_cfg.pretrained)
 
-        if not isinstance(openclip_cfg.prompt_templates, list) or len(openclip_cfg.prompt_templates) != 32:
-            raise ValueError("openclip_cfg.prompt_templates must be a list of 32 templates.")
+        if not isinstance(openclip_cfg.prompt_templates, list) or len(openclip_cfg.prompt_templates) != 64:
+            raise ValueError("openclip_cfg.prompt_templates must be a list of 64 templates.")
 
         for idx, template in enumerate(openclip_cfg.prompt_templates):
             if "{}" not in str(template):
@@ -329,10 +329,10 @@ class SAM3ModelBuilder(FrozenModuleMixin):
                 f"{cfg.residual_scale_init!r}."
             )
 
-        if cfg.score_embed_dim <= 0 or cfg.score_embed_dim % 2 != 0:
+        if cfg.score_embed_dim <= 0:
             raise ValueError(
-                "encoder_refiner_cfg.score_embed_dim must be a positive "
-                f"even integer, got {cfg.score_embed_dim}."
+                "encoder_refiner_cfg.score_embed_dim must be positive, "
+                f"got {cfg.score_embed_dim}."
             )
 
         return cfg

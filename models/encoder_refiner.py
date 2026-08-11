@@ -8,10 +8,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .score_embeddings import ClipScoreEmbedding
-from .encoder_refiner_attention import (
-    EncoderRefinerLayer,
-    make_residual_scale,
-)
+from .encoder_refiner_attention import EncoderRefinerLayer
 from .refiner_pyramid_decoder import RefinerPyramidDecoder
 
 
@@ -20,9 +17,8 @@ class ClassConditionedEncoderRefiner(nn.Module):
 
     Takes the full 6-layer SAM3 encoder output after prompt cross-attention
     as input. The feature stream is the bilinear-downsampled encoder feature
-    without any FPN injection. SAM3 FPN72 is downsampled to 36×36 and fused
-    into the score stream (RemoteCLIP score embedding) via a learnable
-    residual injection before the Refiner attention layers.
+    without any FPN injection. The score stream comes directly from
+    ClipScoreEmbedding (score_embeddings.py) without any SAM3 FPN fusion.
 
     The Refiner outputs 36×36 features. High-resolution decoding is handled
     by RefinerPyramidDecoder: three-stage semantic–detail dual-branch
@@ -34,7 +30,6 @@ class ClassConditionedEncoderRefiner(nn.Module):
 
     Forward inputs:
         encoder_features_72:  [B, C, 256, 72, 72]  (full encoder + cross-attention)
-        sam_fpn_72:           [B, 256, 72, 72]      (SAM3 backbone image-level FPN72)
         clip_image_feat_map:  [B, D_clip, 36, 36]
         sam_text_mean:        [B, C, 256]
         class_names:          list of C class names
@@ -43,8 +38,8 @@ class ClassConditionedEncoderRefiner(nn.Module):
         refiner_features_36:  [B, C, 256, 36, 36]
         score_embed_36:       [B, C, 256, 36, 36]
         clip_score_embed_36:  [B, C, 256, 36, 36]
-        clip_score_maps_36:   [B, C,  32, 36, 36]
-        template_clip_text:   [C, 32, D_clip]
+        clip_score_maps_36:   [B, C,  64, 36, 36]
+        template_clip_text:   [C, 64, D_clip]
     """
 
     def __init__(
@@ -73,11 +68,11 @@ class ClassConditionedEncoderRefiner(nn.Module):
 
         if prompt_templates is None:
             raise ValueError(
-                "prompt_templates must be a list of 32 prompt templates."
+                "prompt_templates must be a list of 64 prompt templates."
             )
-        if len(prompt_templates) != 32:
+        if len(prompt_templates) != 64:
             raise ValueError(
-                f"Expected 32 prompt templates, got {len(prompt_templates)}."
+                f"Expected 64 prompt templates, got {len(prompt_templates)}."
             )
 
         self.clip_score_embed = ClipScoreEmbedding(
@@ -88,29 +83,6 @@ class ClassConditionedEncoderRefiner(nn.Module):
             score_embed_dim=int(score_embed_dim),
             text_prompt_batch_size=int(text_prompt_batch_size),
             text_prompt_use_checkpoint=bool(text_prompt_use_checkpoint),
-        )
-
-        self.fpn_score_fusion_36 = nn.Sequential(
-            nn.Conv2d(
-                self.score_embed_dim + self.hidden_dim,
-                self.score_embed_dim,
-                kernel_size=1,
-                bias=True,
-            ),
-            nn.Conv2d(
-                self.score_embed_dim,
-                self.score_embed_dim,
-                kernel_size=3,
-                padding=1,
-                bias=True,
-            ),
-        )
-        for module in self.fpn_score_fusion_36:
-            nn.init.xavier_uniform_(module.weight)
-            nn.init.zeros_(module.bias)
-
-        self.fpn_score_injection_scale = make_residual_scale(
-            float(residual_scale_init)
         )
 
         self.layers = nn.ModuleList([
@@ -131,105 +103,6 @@ class ClassConditionedEncoderRefiner(nn.Module):
             branch_dim=128,
             spatial_groups=8,
             use_checkpoint=self.use_checkpoint,
-        )
-
-    def _inject_sam_fpn_into_score_36(
-        self,
-        score_embed_36: torch.Tensor,
-        sam_fpn_72: torch.Tensor,
-    ) -> torch.Tensor:
-        """Inject SAM3 FPN72 into the score stream at 36×36.
-
-        FPN72 is bilinear-downsampled to 36×36, expanded with a class
-        dimension, concatenated with the score embedding, and fused via
-        1×1 + 3×3 conv. The resulting update is added to the score stream
-        through a learnable residual scale.
-        """
-        if score_embed_36.ndim != 5:
-            raise ValueError(
-                "score_embed_36 must be [B, C, D_score, 36, 36], "
-                f"got {tuple(score_embed_36.shape)}."
-            )
-        if sam_fpn_72.ndim != 4:
-            raise ValueError(
-                "sam_fpn_72 must be [B, D, 72, 72], "
-                f"got {tuple(sam_fpn_72.shape)}."
-            )
-
-        batch_size, num_classes, score_dim, H_score, W_score = (
-            score_embed_36.shape
-        )
-
-        expected_score_shape = (
-            batch_size,
-            num_classes,
-            self.score_embed_dim,
-            36,
-            36,
-        )
-        if tuple(score_embed_36.shape) != expected_score_shape:
-            raise ValueError(
-                "score_embed_36 shape mismatch: expected "
-                f"{expected_score_shape}, got "
-                f"{tuple(score_embed_36.shape)}."
-            )
-
-        expected_fpn_shape = (
-            batch_size,
-            self.hidden_dim,
-            72,
-            72,
-        )
-        if tuple(sam_fpn_72.shape) != expected_fpn_shape:
-            raise ValueError(
-                "sam_fpn_72 shape mismatch: expected "
-                f"{expected_fpn_shape}, got "
-                f"{tuple(sam_fpn_72.shape)}."
-            )
-
-        sam_fpn_72 = sam_fpn_72.to(
-            device=score_embed_36.device,
-            dtype=score_embed_36.dtype,
-        )
-        sam_fpn_36 = F.interpolate(
-            sam_fpn_72,
-            size=(36, 36),
-            mode="bilinear",
-            align_corners=False,
-        )
-        sam_fpn_36 = sam_fpn_36[:, None].expand(
-            batch_size,
-            num_classes,
-            self.hidden_dim,
-            36,
-            36,
-        )
-
-        fusion_input = torch.cat(
-            [score_embed_36, sam_fpn_36],
-            dim=2,
-        )
-        fusion_input_flat = fusion_input.reshape(
-            batch_size * num_classes,
-            self.score_embed_dim + self.hidden_dim,
-            36,
-            36,
-        )
-
-        fpn_score_update_36 = self.fpn_score_fusion_36(
-            fusion_input_flat
-        )
-        fpn_score_update_36 = fpn_score_update_36.reshape(
-            batch_size,
-            num_classes,
-            self.score_embed_dim,
-            36,
-            36,
-        )
-
-        return (
-            score_embed_36
-            + self.fpn_score_injection_scale * fpn_score_update_36
         )
 
     def decode_feature_pyramid_chunk(
@@ -270,76 +143,87 @@ class ClassConditionedEncoderRefiner(nn.Module):
     def forward(
         self,
         encoder_features_72: torch.Tensor,
-        sam_fpn_72: torch.Tensor,
         clip_image_feat_map: torch.Tensor,
         sam_text_mean: torch.Tensor,
         class_names: List[str],
     ) -> dict[str, torch.Tensor]:
-        """Run the full Refiner at 36×36 on all classes at once.
+        """Run the full 36×36 Refiner on all classes simultaneously.
 
         Args:
-            encoder_features_72:  [B, C, 256, 72, 72]
-                Full 6-layer encoder output after prompt cross-attention.
-            sam_fpn_72:           [B, 256, 72, 72]
-                SAM3 backbone image-level FPN72 (no class dimension).
-            clip_image_feat_map:  [B, D_clip, 36, 36]
-            sam_text_mean:        [B, C, 256]
-            class_names:          list of C class names
+            encoder_features_72:
+                [B, C, 256, 72, 72] full encoder output after
+                prompt cross-attention.
+            clip_image_feat_map:
+                [B, D_clip, 36, 36] dense RemoteCLIP feature map.
+            sam_text_mean:
+                [B, C, 256] mean SAM3 text features.
+            class_names:
+                List containing C prompt names.
 
-        Returns dict with keys:
-            refiner_features_36
-            score_embed_36
-            clip_score_embed_36
-            clip_score_maps_36
-            template_clip_text
-
-        The Refiner operates on ALL classes simultaneously so that
-        cross-class attention works correctly. High-resolution pyramid
-        decoding is handled per chunk via decode_feature_pyramid_chunk().
+        Returns:
+            refiner_features_36:
+                [B, C, 256, 36, 36]
+            score_embed_36:
+                [B, C, 256, 36, 36] score stream after all Refiner layers.
+            clip_score_embed_36:
+                [B, C, 256, 36, 36] initial pure RemoteCLIP score embedding.
+            clip_score_maps_36:
+                [B, C, 64, 36, 36]
+            template_clip_text:
+                [C, 64, D_clip]
         """
         if encoder_features_72.ndim != 5:
             raise ValueError(
-                f"encoder_features_72 must be [B, C, D, 72, 72], "
+                "encoder_features_72 must be [B, C, D, 72, 72], "
                 f"got {tuple(encoder_features_72.shape)}."
             )
 
-        batch_size, num_classes, hidden_dim, H, W = encoder_features_72.shape
+        batch_size, num_classes, hidden_dim, height, width = (
+            encoder_features_72.shape
+        )
 
         if hidden_dim != self.hidden_dim:
             raise ValueError(
-                f"encoder_features_72 hidden_dim mismatch: "
-                f"expected {self.hidden_dim}, got {hidden_dim}."
+                "encoder_features_72 hidden_dim mismatch: expected "
+                f"{self.hidden_dim}, got {hidden_dim}."
             )
 
-        if (H, W) != (72, 72):
+        if (height, width) != (72, 72):
             raise ValueError(
-                f"ClassConditionedEncoderRefiner expects 72×72 encoder features, "
-                f"got {(H, W)}."
+                "ClassConditionedEncoderRefiner expects 72×72 "
+                f"encoder features, got {(height, width)}."
             )
 
-        if tuple(sam_fpn_72.shape) != (
-            batch_size,
-            self.hidden_dim,
-            72,
-            72,
-        ):
+        if clip_image_feat_map.ndim != 4:
             raise ValueError(
-                f"sam_fpn_72 must be [{batch_size}, {self.hidden_dim}, 72, 72], "
-                f"got {tuple(sam_fpn_72.shape)}."
+                "clip_image_feat_map must be [B, D_clip, 36, 36], "
+                f"got {tuple(clip_image_feat_map.shape)}."
+            )
+
+        if clip_image_feat_map.shape[0] != batch_size:
+            raise ValueError(
+                "clip_image_feat_map batch mismatch: expected "
+                f"{batch_size}, got {clip_image_feat_map.shape[0]}."
             )
 
         if tuple(clip_image_feat_map.shape[-2:]) != (36, 36):
             raise ValueError(
-                f"clip_image_feat_map must be 36×36, "
+                "clip_image_feat_map must be 36×36, "
                 f"got {tuple(clip_image_feat_map.shape[-2:])}."
             )
-        if tuple(sam_text_mean.shape) != (batch_size, num_classes, hidden_dim):
+
+        expected_text_shape = (
+            batch_size,
+            num_classes,
+            hidden_dim,
+        )
+        if tuple(sam_text_mean.shape) != expected_text_shape:
             raise ValueError(
-                f"sam_text_mean must be [{batch_size}, {num_classes}, {hidden_dim}], "
+                "sam_text_mean shape mismatch: expected "
+                f"{expected_text_shape}, "
                 f"got {tuple(sam_text_mean.shape)}."
             )
 
-        # 1. CLIP score embedding at 36×36.
         (
             clip_score_embed_36,
             clip_score_maps_36,
@@ -349,7 +233,6 @@ class ClassConditionedEncoderRefiner(nn.Module):
             remoteclip_feat_map=clip_image_feat_map,
         )
 
-        # 2. Downsample encoder features from 72×72 to 36×36.
         base_feature_36 = F.interpolate(
             encoder_features_72.reshape(
                 batch_size * num_classes,
@@ -368,24 +251,12 @@ class ClassConditionedEncoderRefiner(nn.Module):
             36,
         )
 
-        # 3. Initial feature stream is base_feature_36 (no FPN injection).
         feature_36 = base_feature_36
 
-        # 4. Inject SAM3 FPN72 into the score stream before Refiner attention.
-        if self.use_checkpoint and self.training:
-            score_embed_36 = checkpoint(
-                self._inject_sam_fpn_into_score_36,
-                clip_score_embed_36,
-                sam_fpn_72,
-                use_reentrant=False,
-            )
-        else:
-            score_embed_36 = self._inject_sam_fpn_into_score_36(
-                score_embed_36=clip_score_embed_36,
-                sam_fpn_72=sam_fpn_72,
-            )
+        # The score embedding produced by score_embeddings.py is now used
+        # directly. No SAM3 FPN injection is performed before attention.
+        score_embed_36 = clip_score_embed_36
 
-        # 5. Run refiner layers.
         for layer in self.layers:
             if self.use_checkpoint and self.training:
                 feature_36, score_embed_36 = checkpoint(

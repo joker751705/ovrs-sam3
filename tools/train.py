@@ -265,20 +265,10 @@ def build_log_getters() -> List[object]:
             for name in internal_names
         ]
 
-        out = {}
-        out.update(
-            summarize_residual_scales(
-                "refiner_internal",
-                internal_params,
-            )
+        return summarize_residual_scales(
+            "refiner_internal",
+            internal_params,
         )
-        out.update(
-            summarize_residual_scales(
-                "fpn_score_injection",
-                [refiner.fpn_score_injection_scale],
-            )
-        )
-        return out
 
     return [project_log_getter]
 
