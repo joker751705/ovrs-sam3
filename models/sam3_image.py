@@ -43,7 +43,6 @@ class Sam3Image(torch.nn.Module):
         encoder_refiner_dropout: float = 0.1,
         encoder_refiner_hidden_dim: int = 256,
         encoder_refiner_score_embed_dim: int = 256,
-        encoder_refiner_residual_scale_init: float = 0.1,
         encoder_refiner_window_size: int = 12,
         encoder_refiner_shift_size: int = 6,
         encoder_refiner_use_checkpoint: bool = True,
@@ -116,9 +115,6 @@ class Sam3Image(torch.nn.Module):
             dropout=float(encoder_refiner_dropout),
             prompt_templates=list(openclip_prompt_templates or []),
             normalize_label_for_clip=bool(normalize_label_for_clip),
-            residual_scale_init=float(
-                encoder_refiner_residual_scale_init
-            ),
             use_checkpoint=bool(encoder_refiner_use_checkpoint),
             text_prompt_batch_size=int(text_prompt_batch_size),
             text_prompt_use_checkpoint=bool(text_prompt_use_checkpoint),

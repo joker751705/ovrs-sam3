@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,22 +8,6 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-
-def make_residual_scale(init_value: float) -> nn.Parameter:
-    value = float(init_value)
-
-    if not math.isfinite(value) or value < 0.0:
-        raise ValueError(
-            "Residual scale initialization must be finite and "
-            f"non-negative, got {init_value!r}."
-        )
-
-    scale = nn.Parameter(
-        torch.tensor(value, dtype=torch.float32)
-    )
-    scale._ovrs_disable_weight_decay = True
-    return scale
 
 
 def flatten_batch_class(
@@ -481,17 +463,24 @@ class WindowScoreAttention(nn.Module):
 
 class EncoderRefinerLayer(nn.Module):
     """
-    One refiner layer operating at 36×36 with pre-norm and independent LayerScale.
+    One refiner layer operating at 36×36 with pre-norm and direct
+    residual updates.
 
     Sequence:
-        1. ClassScoreAttention (pre-norm → attn → LayerScale → residual)
-        2. WindowScoreAttention regular (pre-norm → attn → LayerScale → residual)
-        3. WindowScoreAttention shifted (pre-norm → attn → LayerScale → residual)
-        4. Feature FFN (pre-norm → FFN → LayerScale → residual)
-        5. Score FFN (pre-norm → FFN → LayerScale → residual)
+        1. ClassScoreAttention
+           (pre-norm → attention → output projection → residual)
+        2. WindowScoreAttention regular
+           (pre-norm → attention → output projection → residual)
+        3. WindowScoreAttention shifted
+           (pre-norm → attention → output projection → residual)
+        4. Feature FFN
+           (pre-norm → FFN output projection → residual)
+        5. Score FFN
+           (pre-norm → FFN output projection → residual)
 
-    No post-norm after any sub-layer. Eight independent LayerScale scalars
-    control the update magnitude for each sub-layer.
+    No post-norm is applied inside the layer. Attention update magnitude
+    is learned by the attention output projections, while FFN update
+    magnitude is learned by the second FFN linear projections.
     """
 
     def __init__(
@@ -502,7 +491,6 @@ class EncoderRefinerLayer(nn.Module):
         window_size: int = 12,
         shift_size: int = 6,
         dropout: float = 0.1,
-        residual_scale_init: float = 0.1,
     ):
         super().__init__()
 
@@ -558,35 +546,6 @@ class EncoderRefinerLayer(nn.Module):
         self.ffn_fc2_score = nn.Linear(score_embed_dim * 4, score_embed_dim)
         self.ffn_dropout_score = nn.Dropout(float(dropout))
 
-        # Eight independent LayerScale parameters.
-        self.class_feature_scale = make_residual_scale(
-            residual_scale_init
-        )
-        self.class_score_scale = make_residual_scale(
-            residual_scale_init
-        )
-
-        self.regular_feature_scale = make_residual_scale(
-            residual_scale_init
-        )
-        self.regular_score_scale = make_residual_scale(
-            residual_scale_init
-        )
-
-        self.shifted_feature_scale = make_residual_scale(
-            residual_scale_init
-        )
-        self.shifted_score_scale = make_residual_scale(
-            residual_scale_init
-        )
-
-        self.ffn_feature_scale = make_residual_scale(
-            residual_scale_init
-        )
-        self.ffn_score_scale = make_residual_scale(
-            residual_scale_init
-        )
-
     def _ffn_feature_update(
         self,
         feature: torch.Tensor,
@@ -629,7 +588,7 @@ class EncoderRefinerLayer(nn.Module):
             feature_36:      [B, C, 256, 36, 36]
             score_embed_36:  [B, C, 256, 36, 36]
         """
-        # Class attention (pre-norm).
+        # Class attention: pre-norm → attention → direct residual.
         class_feature = apply_layer_norm_bcdhw(
             feature_36,
             self.class_norm_feature,
@@ -646,16 +605,10 @@ class EncoderRefinerLayer(nn.Module):
             sam_text_mean=class_text,
         )
 
-        feature_36 = (
-            feature_36
-            + self.class_feature_scale * feature_update
-        )
-        score_embed_36 = (
-            score_embed_36
-            + self.class_score_scale * score_update
-        )
+        feature_36 = feature_36 + feature_update
+        score_embed_36 = score_embed_36 + score_update
 
-        # Regular window attention (pre-norm).
+        # Regular window attention.
         regular_feature = apply_layer_norm_bcdhw(
             feature_36,
             self.regular_norm_feature,
@@ -670,16 +623,10 @@ class EncoderRefinerLayer(nn.Module):
             score_embed=regular_score,
         )
 
-        feature_36 = (
-            feature_36
-            + self.regular_feature_scale * feature_update
-        )
-        score_embed_36 = (
-            score_embed_36
-            + self.regular_score_scale * score_update
-        )
+        feature_36 = feature_36 + feature_update
+        score_embed_36 = score_embed_36 + score_update
 
-        # Shifted window attention (pre-norm).
+        # Shifted window attention.
         shifted_feature = apply_layer_norm_bcdhw(
             feature_36,
             self.shifted_norm_feature,
@@ -694,37 +641,23 @@ class EncoderRefinerLayer(nn.Module):
             score_embed=shifted_score,
         )
 
-        feature_36 = (
-            feature_36
-            + self.shifted_feature_scale * feature_update
-        )
-        score_embed_36 = (
-            score_embed_36
-            + self.shifted_score_scale * score_update
-        )
+        feature_36 = feature_36 + feature_update
+        score_embed_36 = score_embed_36 + score_update
 
-        # Feature FFN (pre-norm).
+        # Feature FFN.
         ffn_feature = apply_layer_norm_bcdhw(
             feature_36,
             self.ffn_norm_feature,
         )
         feature_update = self._ffn_feature_update(ffn_feature)
+        feature_36 = feature_36 + feature_update
 
-        feature_36 = (
-            feature_36
-            + self.ffn_feature_scale * feature_update
-        )
-
-        # Score FFN (pre-norm).
+        # Score FFN.
         ffn_score = apply_layer_norm_bcdhw(
             score_embed_36,
             self.ffn_norm_score,
         )
         score_update = self._ffn_score_update(ffn_score)
-
-        score_embed_36 = (
-            score_embed_36
-            + self.ffn_score_scale * score_update
-        )
+        score_embed_36 = score_embed_36 + score_update
 
         return feature_36, score_embed_36

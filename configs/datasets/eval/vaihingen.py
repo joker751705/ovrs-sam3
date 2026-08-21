@@ -5,7 +5,7 @@ val_dataloader = dict(
         img_dir="data/datasets/vaihingen/img_dir/val",
         ann_dir="data/datasets/vaihingen/ann_dir/val",
         classes=[
-        'road',
+        'road,pavement',
         'building',
         'grass',
         'tree',

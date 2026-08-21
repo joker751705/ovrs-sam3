@@ -224,13 +224,19 @@ SAM3 FPN 只在后续 RefinerPyramidDecoder 的 72/144/288 三个
 4. **Feature FFN**：逐 token 更新图像流。
 5. **Score FFN**：逐 token 更新分数流。
 
-每层共 8 个 LayerScale 标量，统一初始化为 0.1。
+每个注意力和 FFN 子层均采用 pre-norm，并在末端线性投影后直接执行残差相加。Refiner 内部不设置固定或可学习残差系数。类间注意力和窗口注意力的更新尺度由各自的 feature/score output projection 学习，两路 FFN 的更新尺度由各自第二个线性投影层学习。
 
-全部 refiner 层结束后，不再对 score embedding 执行最终 LayerNorm。
+全部 Refiner 层结束后，对最终 feature stream 执行一次逐空间位置、沿通道维度的 LayerNorm，再将归一化后的 refiner_features_36 送入 RefinerPyramidDecoder。最终 score stream 不执行额外输出 LayerNorm。
+
+子层执行顺序为：
+
+```text
+pre-norm → attention/FFN → output projection → dropout → direct residual
+```
 
 ### 5.3 多尺度金字塔解码器
 
-Refiner 在所有类别上统一执行后，36×36 特征进入 `RefinerPyramidDecoder`，
+Refiner 在所有类别上统一执行后，最终 36×36 feature stream 先经过一次通道 LayerNorm，再进入 `RefinerPyramidDecoder`，
 三个尺度分别实例化独立的 `SemanticDetailFusionStage`（stage_72 / stage_144 / stage_288）。
 stage_288 输出直接进入冻结 `semantic_seg_head`，不再有最终融合模块。
 
@@ -277,17 +283,6 @@ output = fusion_out_proj(fused_out)
 
 整个 pyramid decoder 使用一次 non-reentrant checkpoint（`self.training and self.use_checkpoint` 时开启），不嵌套给每个 stage。
 
-### 5.4 残差系数日志
-
-训练日志、JSONL 和 W&B 记录 Refiner 相关的残差系数：
-
-| 类别 | 前缀 | 参数数量 |
-| --- | --- | ---: |
-| Refiner 内部 | `residual/refiner_internal/` | 32 |
-
-每类记录 `count`、`mean`、`abs_mean`、`min`、`max` 和
-`negative_ratio`。`residual/refiner_internal/count` 为 32（4 层 × 8 个标量）。
-
 ## 6. 冻结 SAM3 分割头与梯度边界
 
 Prompt cross-attention 在完整 6 层 encoder 之后、Refiner 之前执行一次（通过 `apply_prompt_cross_attention()`），位于 `torch.no_grad()` 中。
@@ -327,7 +322,6 @@ OpenCLIP 常把 Q/K/V 存在同一个融合参数中。项目对该参数注册�
 * encoder refiner 使用 1.0 倍学习率；
 * RemoteCLIP text/image 使用 0.01 倍学习率，即 `1e-6`；
 * normalization 参数不使用 weight decay；
-* 所有残差系数（Refiner 内部共 32 个 LayerScale）使用 `_ovrs_disable_weight_decay` 标记，weight decay 强制为 0；全部由同一个 `residual_scale_init` 配置初始化；
 * 梯度裁剪上限为 0.1；
 * warmup 保持前 1000 步，线性从 0.1 倍到全额学习率，后续余弦衰减。
 
@@ -492,9 +486,9 @@ python tools/train.py configs/train/isaid_loveda_full.py
 | 文件                                    | 职责                                       |
 | ------------------------------------- | ---------------------------------------- |
 | `models/sam3_image.py`                | 类别 chunk、缓存、SAM3 encoder、低分辨率 refiner、逐 chunk 高分辨率解码 |
-| `models/encoder_refiner.py`           | 全类别 Refiner 与多尺度金字塔解码接口 |
+| `models/encoder_refiner.py`           | 全类别 Refiner、最终 feature LayerNorm 与多尺度金字塔解码接口 |
 | `models/refiner_pyramid_decoder.py`   | 三阶段语义—细节双路融合上采样，stage_288 直接输出最终高分辨率特征 |
-| `models/encoder_refiner_attention.py` | 跨类别/窗口注意力、双流 FFN 与 LayerScale            |
+| `models/encoder_refiner_attention.py` | 跨类别/窗口注意力、双流 FFN、pre-norm 与直接残差更新            |
 | `models/maskformer_segmentation.py`   | prompt attention、Pixel Decoder 多尺度输出和原始 semantic head |
 | `models/score_embeddings.py`          | 64 模板相似度图、归一化 CLIP 融合和空间卷积增强 |
 | `models/openclip_image_encoder.py`    | 36×36 dense RemoteCLIP 图像特征              |
@@ -530,7 +524,7 @@ python tools/train.py configs/train/isaid_loveda_full.py
 17. teacher 只来自原始 O288 并且必须 detach。teacher 和 student 都为 288×288。
 18. 蒸馏只监督存在类别。每个存在提示均监督全部 GT 有效像素，并额外监督其原始类别 GT 外侧 `sam3_mask_distill_boundary_width` 像素范围内且标签为 255 的边界环。远处 255 区域不参与蒸馏。多个提示映射到同一类别时复用相同外环，并在全局分母中按提示独立计数。
 19. 最终掩码 logits 由冻结的 SAM3 `semantic_seg_head` 产生。
-20. Refiner 内部残差系数统一由 `residual_scale_init` 控制，默认值为 0.1；这些标量不使用 weight decay。
+20. Refiner 的类间注意力、常规窗口注意力、移位窗口注意力和双流 FFN 均采用 pre-norm，并在末端线性投影后直接执行残差相加，不允许重新引入固定或可学习残差系数。全部 Refiner 层结束后，必须对最终 feature_36 执行一次通道 LayerNorm；最终 score_embed_36 不执行额外输出 LayerNorm。
 21. TTA 必须先平均提示空间分数（`raw_prompt_score_map`），再合并提示到原始类别，最后进行相对阈值过滤。
 22. `reduce_zero_label` 与 `background_cfg` 各自只执行其定义的一次标签空间变换。
 23. 完整恢复必须严格校验 checkpoint schema；模型权重迁移必须走独立入口。
@@ -597,3 +591,27 @@ Checkpoint schema 版本为 4。实验追踪状态不再保存在 checkpoint 中
 * 必须使用新的 work directory。
 * 不创建旧参数映射或兼容层。
 * `_CHECKPOINT_VERSION` 继续保持 4，因为 checkpoint 容器格式没有改变。
+
+本次 Refiner 残差与输出归一化重构：
+
+* 删除 `core.encoder_refiner.layers.*.class_feature_scale`。
+* 删除 `core.encoder_refiner.layers.*.class_score_scale`。
+* 删除 `core.encoder_refiner.layers.*.regular_feature_scale`。
+* 删除 `core.encoder_refiner.layers.*.regular_score_scale`。
+* 删除 `core.encoder_refiner.layers.*.shifted_feature_scale`。
+* 删除 `core.encoder_refiner.layers.*.shifted_score_scale`。
+* 删除 `core.encoder_refiner.layers.*.ffn_feature_scale`。
+* 删除 `core.encoder_refiner.layers.*.ffn_score_scale`。
+* 删除配置字段 `encoder_refiner_cfg.residual_scale_init` 及其完整构建链路。
+* 删除 `residual/refiner_internal/*` 训练、JSONL 和 W&B 日志。
+* 新增 `core.encoder_refiner.feature_output_norm.weight`。
+* 新增 `core.encoder_refiner.feature_output_norm.bias`。
+* Refiner 内部继续保持 pre-norm；所有注意力和 FFN 子层改为直接残差相加。
+* 全部 Refiner 层结束后，对最终 feature_36 执行一次通道 LayerNorm。
+* 最终 score_embed_36 不增加输出 LayerNorm。
+* 不增加旧字段兼容、参数占位、参数映射或固定缩放常量。
+* 旧 checkpoint 不能通过 `--resume-from` 严格恢复。
+* 可以通过 `--load-model-from` 非严格加载未变化参数，但旧输出投影是在 LayerScale 存在时训练的，不保证删除系数后具有等价数值行为。
+* 非严格加载旧 checkpoint 时，新的 feature_output_norm 使用默认初始化：weight 为 1、bias 为 0。
+* 新实验必须使用新的 work directory。
+* `_CHECKPOINT_VERSION` 保持为 4，因为 checkpoint 容器格式没有变化。

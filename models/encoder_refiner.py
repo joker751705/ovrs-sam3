@@ -8,7 +8,10 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .score_embeddings import ClipScoreEmbedding
-from .encoder_refiner_attention import EncoderRefinerLayer
+from .encoder_refiner_attention import (
+    EncoderRefinerLayer,
+    apply_layer_norm_bcdhw,
+)
 from .refiner_pyramid_decoder import RefinerPyramidDecoder
 
 
@@ -27,6 +30,11 @@ class ClassConditionedEncoderRefiner(nn.Module):
     with original SAM3 backbone FPN. Both branches use independent Refiner
     projections. stage_288 output goes directly into the frozen
     semantic_seg_head.
+
+    After all Refiner layers, the accumulated 36×36 feature stream is
+    normalized once with a channel-wise LayerNorm before being returned
+    and passed to RefinerPyramidDecoder. The final score stream is not
+    post-normalized.
 
     Forward inputs:
         encoder_features_72:  [B, C, 256, 72, 72]  (full encoder + cross-attention)
@@ -55,7 +63,6 @@ class ClassConditionedEncoderRefiner(nn.Module):
         dropout: float = 0.1,
         prompt_templates: list[str] | None = None,
         normalize_label_for_clip: bool = True,
-        residual_scale_init: float = 0.1,
         use_checkpoint: bool = True,
         text_prompt_batch_size: int = 64,
         text_prompt_use_checkpoint: bool = True,
@@ -93,10 +100,14 @@ class ClassConditionedEncoderRefiner(nn.Module):
                 window_size=int(window_size),
                 shift_size=int(shift_size),
                 dropout=float(dropout),
-                residual_scale_init=float(residual_scale_init),
             )
             for _ in range(self.num_fusion_layers)
         ])
+
+        # Final normalization for the accumulated feature residual stream.
+        # This is applied once after all Refiner layers and before the
+        # 36×36 feature enters the Pyramid Decoder.
+        self.feature_output_norm = nn.LayerNorm(self.hidden_dim)
 
         self.pyramid_decoder = RefinerPyramidDecoder(
             hidden_dim=self.hidden_dim,
@@ -162,7 +173,8 @@ class ClassConditionedEncoderRefiner(nn.Module):
 
         Returns:
             refiner_features_36:
-                [B, C, 256, 36, 36]
+                [B, C, 256, 36, 36] feature stream after all Refiner
+                layers and the final channel-wise LayerNorm.
             score_embed_36:
                 [B, C, 256, 36, 36] score stream after all Refiner layers.
             clip_score_embed_36:
@@ -272,6 +284,12 @@ class ClassConditionedEncoderRefiner(nn.Module):
                     score_embed_36=score_embed_36,
                     sam_text_mean=sam_text_mean,
                 )
+
+        # Normalize the accumulated feature stream once after all Refiner layers.
+        feature_36 = apply_layer_norm_bcdhw(
+            feature_36,
+            self.feature_output_norm,
+        )
 
         return {
             "refiner_features_36": feature_36,

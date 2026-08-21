@@ -8,7 +8,7 @@ import random
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -216,61 +216,6 @@ def _to_builtin(obj):
 
 def print_config_as_json(cfg) -> None:
     print(json.dumps(_to_builtin(cfg), indent=2, ensure_ascii=False))
-
-
-def build_log_getters() -> List[object]:
-    def summarize_residual_scales(prefix, params):
-        params = [
-            param.detach().reshape(-1).float()
-            for param in params
-            if isinstance(param, torch.Tensor) and param.requires_grad
-        ]
-        if not params:
-            return {}
-
-        values = torch.cat(params)
-        return {
-            f"residual/{prefix}/count": int(values.numel()),
-            f"residual/{prefix}/mean": float(values.mean().item()),
-            f"residual/{prefix}/abs_mean": float(values.abs().mean().item()),
-            f"residual/{prefix}/min": float(values.min().item()),
-            f"residual/{prefix}/max": float(values.max().item()),
-            f"residual/{prefix}/negative_ratio": float(
-                (values < 0).float().mean().item()
-            ),
-        }
-
-    def project_log_getter(trainer):
-        model = trainer.model
-        model = getattr(model, "module", model)
-        core = getattr(model, "core", None)
-        refiner = getattr(core, "encoder_refiner", None)
-
-        if refiner is None:
-            return {}
-
-        internal_names = (
-            "class_feature_scale",
-            "class_score_scale",
-            "regular_feature_scale",
-            "regular_score_scale",
-            "shifted_feature_scale",
-            "shifted_score_scale",
-            "ffn_feature_scale",
-            "ffn_score_scale",
-        )
-        internal_params = [
-            getattr(layer, name, None)
-            for layer in refiner.layers
-            for name in internal_names
-        ]
-
-        return summarize_residual_scales(
-            "refiner_internal",
-            internal_params,
-        )
-
-    return [project_log_getter]
 
 
 def _unwrap_state_dict(obj: Any) -> Dict[str, torch.Tensor]:
@@ -496,9 +441,6 @@ def main():
         visualizer=visualizer,
         raw_cfg_for_logging=_to_builtin(cfg),
     )
-
-    for getter in build_log_getters():
-        trainer.register_log_getter(getter)
 
     if args.resume_from:
         trainer.resume_from(args.resume_from)

@@ -108,9 +108,7 @@ model = dict(
         num_heads=8,
         dropout=0.1,
         hidden_dim=256,
-
         score_embed_dim=256,
-        residual_scale_init=0.1,
 
         refiner_hw=36,
         encoder_hw=72,
@@ -132,7 +130,7 @@ model = dict(
     ),
 
     adapter_cfg=dict(
-        class_relative_prob_thd=0.5,
+        class_relative_prob_thd=0.0,
         class_relative_eps=1e-6,
     ),
 
