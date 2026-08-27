@@ -17,34 +17,24 @@ class SemanticDetailFusionStage(nn.Module):
     and detail (Refiner + original SAM3 FPN).
 
     Both branches operate in 128-channel compact space with independent
-    grouped 3×3 conv blocks (groups=8). Each branch uses its own dedicated
-    Refiner projection. After projecting back to 256 channels, the two
-    branches are summed with equal weight and passed through a final
-    1×1 Conv.
+    standard 3×3 conv blocks. Each branch uses its own dedicated Refiner
+    projection. After projecting back to 256 channels, the two branches
+    are summed with equal weight and passed through a final 1×1 Conv.
     """
 
     def __init__(
         self,
         hidden_dim: int = 256,
         branch_dim: int = 128,
-        spatial_groups: int = 8,
     ):
         super().__init__()
         if hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be > 0, got {hidden_dim}")
         if branch_dim <= 0:
             raise ValueError(f"branch_dim must be > 0, got {branch_dim}")
-        if spatial_groups <= 0:
-            raise ValueError(f"spatial_groups must be > 0, got {spatial_groups}")
-        if branch_dim % spatial_groups != 0:
-            raise ValueError(
-                f"branch_dim ({branch_dim}) must be divisible by "
-                f"spatial_groups ({spatial_groups})"
-            )
 
         self.hidden_dim = int(hidden_dim)
         self.branch_dim = int(branch_dim)
-        self.spatial_groups = int(spatial_groups)
 
         # Four independent 256→128 projections (no activation).
         self.semantic_refiner_proj = nn.Sequential(
@@ -88,7 +78,6 @@ class SemanticDetailFusionStage(nn.Module):
                 self.branch_dim,
                 kernel_size=3,
                 padding=1,
-                groups=self.spatial_groups,
                 bias=False,
             ),
             _safe_group_norm(self.branch_dim),
@@ -189,9 +178,9 @@ class RefinerPyramidDecoder(nn.Module):
       - original SAM3 backbone FPN (detail branch)
 
     Both branches operate in 128-channel compact space with independent
-    grouped 3×3 conv blocks (groups=8). Each branch uses its own dedicated
-    Refiner projection. The two branches are summed with equal weight and
-    passed through a final 1×1 Conv. No learnable residual scale.
+    standard 3×3 conv blocks. Each branch uses its own dedicated Refiner
+    projection. The two branches are summed with equal weight and passed
+    through a final 1×1 Conv. No learnable residual scale.
 
     Stages:
         stage_72:  36→72   (refiner_36 + O72 + FPN72)
@@ -209,7 +198,6 @@ class RefinerPyramidDecoder(nn.Module):
         self,
         hidden_dim: int = 256,
         branch_dim: int = 128,
-        spatial_groups: int = 8,
         use_checkpoint: bool = True,
     ):
         super().__init__()
@@ -219,7 +207,6 @@ class RefinerPyramidDecoder(nn.Module):
         stage_kwargs = dict(
             hidden_dim=self.hidden_dim,
             branch_dim=int(branch_dim),
-            spatial_groups=int(spatial_groups),
         )
 
         self.stage_72 = SemanticDetailFusionStage(**stage_kwargs)

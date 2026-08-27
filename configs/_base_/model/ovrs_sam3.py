@@ -130,7 +130,7 @@ model = dict(
     ),
 
     adapter_cfg=dict(
-        class_relative_prob_thd=0.0,
+        class_relative_prob_thd=0.5,
         class_relative_eps=1e-6,
     ),
 
@@ -139,7 +139,7 @@ model = dict(
         final_balanced_bce_weight=1.0,
         final_dice_weight=0.0,
         eps=1e-6,
-        sam3_mask_distill_weight=0.2,
-        sam3_mask_distill_boundary_width=5,
+        sam3_mask_distill_weight=0.5,
+        sam3_mask_distill_boundary_width=3,
     ),
 )

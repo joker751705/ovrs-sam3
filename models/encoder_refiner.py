@@ -112,7 +112,6 @@ class ClassConditionedEncoderRefiner(nn.Module):
         self.pyramid_decoder = RefinerPyramidDecoder(
             hidden_dim=self.hidden_dim,
             branch_dim=128,
-            spatial_groups=8,
             use_checkpoint=self.use_checkpoint,
         )
 

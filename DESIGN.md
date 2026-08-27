@@ -263,8 +263,8 @@ FPN 先按图像投影到 128 通道，再通过广播与 Refiner 逐类别相�
 两条独立支路（不能共享参数），结构相同：
 
 ```text
-block: 3×3 grouped conv (128→128, groups=8) → GN(8,128) → GELU
-     → 1×1 conv (128→128) → GN(8,128)
+block: 普通 3×3 Conv (128→128) → GN(8,128) → GELU
+     → 1×1 Conv (128→128) → GN(8,128)
 output = input + block(input)   # block 内部残差
 ```
 
@@ -534,7 +534,7 @@ python tools/train.py configs/train/isaid_loveda_full.py
 27. backbone_fpn 顺序固定为 `[288, 144, 72]`，即 `backbone_fpn[0]` 为 288、`[1]` 为 144、`[2]` 为 72。
 28. 原始 FPN 在 256 通道时不按类别复制；FPN 先按图像投影到 128 通道，再按类别广播。
 29. FPN 投影模块可训练，每个 chunk 重新计算，不跨 chunk 缓存计算图。
-30. 三个 stage 固定 `branch_dim=128`、`groups=8`。
+30. 三个 stage 固定 `branch_dim=128`，3×3 卷积使用普通卷积（无分组）。
 31. stage_288 直接返回，无最终融合模块。
 32. 最终 logits 由冻结 `semantic_seg_head` 生成。
 
