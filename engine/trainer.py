@@ -199,6 +199,13 @@ class Trainer:
     # Training step
     # ------------------------------------------------------------------
 
+    def _get_loss_train_progress(self) -> float:
+        """Return 0 at the first step and 1 at the final optimizer step."""
+        max_iters = int(self.cfg.max_iters)
+        if max_iters <= 1:
+            return 0.0
+        return min(max(float(self.global_iter) / (max_iters - 1), 0.0), 1.0)
+
     def _compute_train_loss_streaming(
         self,
         batch,
@@ -234,7 +241,7 @@ class Trainer:
         refiner_features_36 = refiner_out["refiner_features_36"]
         del refiner_out
 
-        B, C_total = refiner_features_36.shape[:2]
+        C_total = int(refiner_features_36.shape[1])
 
         metadata = batch.find_metadatas[0]
 
@@ -270,6 +277,7 @@ class Trainer:
         refiner_proxy = refiner_features_36.detach().requires_grad_(True)
 
         # Build streaming loss context once.
+        train_progress = self._get_loss_train_progress()
         with autocast(device_type=self.device.type, enabled=use_amp):
             loss_context = self.criterion.prepare_streaming_context(
                 targets={"label_map": label_map},
@@ -277,15 +285,12 @@ class Trainer:
                 prompt_to_class_id=prompt_to_class_id,
                 num_label_classes=num_label_classes,
                 target_hw=(288, 288),
+                train_progress=train_progress,
             )
 
-        effective_distill_weight = float(
-            loss_context.sam3_mask_distill_weight
-        )
-
         need_teacher_logits = (
-            effective_distill_weight > 0.0
-            and loss_context.distill_pixel_denom > 0
+            loss_context.teacher_mix_ratio > 0.0
+            and loss_context.mixed_pixel_denom > 0
         )
 
         chunk_class_counts = encoder_refiner_cache["chunk_class_counts"]
@@ -296,6 +301,12 @@ class Trainer:
         chunk_start = 0
         for num_chunk_classes in chunk_class_counts:
             chunk_end = chunk_start + num_chunk_classes
+
+            chunk_has_present_pair = bool(
+                loss_context.presence_target[
+                    :, chunk_start:chunk_end
+                ].any().item()
+            )
 
             refiner_proxy_chunk = refiner_proxy[
                 :, chunk_start:chunk_end
@@ -308,7 +319,10 @@ class Trainer:
                         refiner_feature_36_chunk=refiner_proxy_chunk,
                         class_start=chunk_start,
                         class_end=chunk_end,
-                        return_teacher_logits=need_teacher_logits,
+                        return_teacher_logits=(
+                            need_teacher_logits
+                            and chunk_has_present_pair
+                        ),
                     )
                 )
 
@@ -326,10 +340,9 @@ class Trainer:
 
             # Accumulate detached stats on GPU.
             for key in (
-                "loss_final_bce",
+                "loss_mixed_bce",
+                "loss_mixed_bce_weighted",
                 "loss_final_dice",
-                "loss_sam3_mask_distill_bce",
-                "loss_sam3_mask_distill_weighted",
                 "total_loss",
             ):
                 val = chunk_loss_dict.get(key)
@@ -350,6 +363,18 @@ class Trainer:
                 f"Chunk index mismatch: final chunk_start={chunk_start}, "
                 f"expected C_total={C_total}."
             )
+
+        accum["mixed_bce_train_progress"] = (
+            refiner_features_36.new_tensor(train_progress)
+        )
+        accum["mixed_bce_gt_ratio"] = (
+            refiner_features_36.new_tensor(loss_context.gt_mix_ratio)
+        )
+        accum["mixed_bce_teacher_ratio"] = (
+            refiner_features_36.new_tensor(
+                loss_context.teacher_mix_ratio
+            )
+        )
 
         # ---- Hand proxy gradient back to real Refiner graph ----
         if refiner_proxy.grad is None:

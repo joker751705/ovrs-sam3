@@ -156,9 +156,9 @@ def _short_key_name(key: str) -> str:
 
 def _compact_key_name(key: str) -> str:
     mapping = {
-        "final_balanced_bce_weight": "bbce",
+        "mixed_bce_weight": "mixed_bce",
         "final_dice_weight": "dice",
-        "sam3_mask_distill_weight": "distill",
+        "mixed_bce_boundary_width": "boundary",
         "score_embed_dim": "score_dim",
         "layer_scale_init": "lsi",
         "openclip_text_finetune": "text",

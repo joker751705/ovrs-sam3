@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -32,7 +33,7 @@ class SemanticStreamingContext:
     # [B, M, H, W] bool.
     # M is the number of original label classes.
     # Only contains class-specific outer boundaries in ignore pixels.
-    distill_outer_boundary_by_class: torch.Tensor
+    outer_boundary_by_class: torch.Tensor
 
     num_prompt_channels: int
     num_label_classes: int
@@ -40,60 +41,52 @@ class SemanticStreamingContext:
     # Number of present image-prompt pairs.
     num_present_pairs: int
 
-    # Total selected distillation pixels across all present prompts.
-    distill_pixel_denom: int
+    # Total selected pixels across all present image-prompt pairs.
+    mixed_pixel_denom: int
 
-    # Number of valid pixels multiplied by P.
-    total_valid_pixels: int
-
-    sam3_mask_distill_weight: float
+    # Cosine-scheduled target mixture for the current optimizer step.
+    gt_mix_ratio: float
+    teacher_mix_ratio: float
 
 
 class SemanticCriterion(nn.Module):
     """Semantic segmentation criterion with streaming per-chunk support.
 
-    Losses:
-        1. Plain BCE on final_logits — every valid pixel (label ≠ 255)
-           contributes equally regardless of class presence or pixel sign.
-           Global mean over all B × P × H × W valid pixel positions.
+    The main loss is one BCE over a cosine-scheduled mixture of the frozen
+    SAM3 teacher probability and the binary GT target. Only image-prompt
+    pairs whose original class is present are supervised. GT and teacher use
+    the exact same pixels: all valid GT pixels plus the class-specific outer
+    boundary restricted to ignore pixels.
 
-        2. Optional Dice on final_logits (default weight 0.0)
-
-        3. SAM3 teacher mask distillation BCE (fixed weight)
-           - Frozen SAM3 semantic head logits as soft targets
-           - Only present image-prompt pairs
-           - All valid GT pixels plus a configurable class-specific
-             outer boundary restricted to ignore pixels
+    Dice remains optional and disabled by default.
     """
 
     def __init__(self, cfg: Optional[SemanticCriterionConfig] = None):
         super().__init__()
         self.cfg = cfg or SemanticCriterionConfig()
 
-        distill_weight = float(self.cfg.sam3_mask_distill_weight)
-        if distill_weight < 0.0:
+        mixed_bce_weight = float(self.cfg.mixed_bce_weight)
+        if mixed_bce_weight < 0.0:
             raise ValueError(
-                "sam3_mask_distill_weight must be >= 0, "
-                f"got {distill_weight}."
+                "mixed_bce_weight must be >= 0, "
+                f"got {mixed_bce_weight}."
             )
 
-        boundary_width = (
-            self.cfg.sam3_mask_distill_boundary_width
-        )
+        boundary_width = self.cfg.mixed_bce_boundary_width
 
         if (
             isinstance(boundary_width, bool)
             or not isinstance(boundary_width, int)
         ):
             raise TypeError(
-                "sam3_mask_distill_boundary_width must be "
+                "mixed_bce_boundary_width must be "
                 "a non-negative integer, "
                 f"got {boundary_width!r}."
             )
 
         if boundary_width < 0:
             raise ValueError(
-                "sam3_mask_distill_boundary_width must be >= 0, "
+                "mixed_bce_boundary_width must be >= 0, "
                 f"got {boundary_width}."
             )
 
@@ -108,6 +101,7 @@ class SemanticCriterion(nn.Module):
         prompt_to_class_id: torch.Tensor,
         num_label_classes: int,
         reduction: str = "mean",
+        train_progress: float = 1.0,
     ) -> TensorDict:
         """Full prompt-space loss forward."""
         if reduction != "mean":
@@ -136,6 +130,7 @@ class SemanticCriterion(nn.Module):
             prompt_to_class_id=prompt_to_class_id,
             num_label_classes=int(num_label_classes),
             target_hw=final_logits.shape[-2:],
+            train_progress=train_progress,
         )
 
         target_full, _ = self._build_binary_targets(
@@ -159,6 +154,7 @@ class SemanticCriterion(nn.Module):
         prompt_to_class_id: torch.Tensor,
         num_label_classes: int,
         target_hw: tuple[int, int] = (288, 288),
+        train_progress: float = 1.0,
     ) -> SemanticStreamingContext:
         """Build full-batch statistics before the prompt chunk loop."""
         label_map = self._extract_label_map(targets)
@@ -243,11 +239,6 @@ class SemanticCriterion(nn.Module):
                     f"max={max_label}."
                 )
 
-        total_valid_pixels = (
-            int(valid_mask.sum().item())
-            * num_prompt_channels
-        )
-
         class_ids = torch.arange(
             num_label_classes,
             device=label_map.device,
@@ -277,20 +268,18 @@ class SemanticCriterion(nn.Module):
             presence_target.sum().item()
         )
 
-        boundary_width = int(
-            self.cfg.sam3_mask_distill_boundary_width
-        )
+        boundary_width = int(self.cfg.mixed_bce_boundary_width)
 
         # [B, M, H, W]
-        distill_outer_boundary_by_class = (
-            self._build_outer_distill_boundary_by_class(
+        outer_boundary_by_class = (
+            self._build_outer_boundary_by_class(
                 class_mask_by_class=class_mask_by_class,
                 ignore_mask=ignore_mask,
                 boundary_width=boundary_width,
             )
         )
 
-        # Every present prompt distills all valid pixels.
+        # Every present prompt supervises all valid pixels.
         # [B]
         valid_pixel_count = (
             valid_mask
@@ -302,7 +291,7 @@ class SemanticCriterion(nn.Module):
         # Each original class additionally owns its own outer boundary.
         # [B, M]
         outer_boundary_pixel_count_by_class = (
-            distill_outer_boundary_by_class
+            outer_boundary_by_class
             .to(dtype=torch.long)
             .flatten(2)
             .sum(dim=2)
@@ -311,7 +300,7 @@ class SemanticCriterion(nn.Module):
         # Valid pixels and outer boundaries are disjoint because the
         # outer boundary is restricted to ignore_mask.
         # [B, M]
-        distill_pixel_count_by_class = (
+        mixed_pixel_count_by_class = (
             valid_pixel_count[:, None]
             + outer_boundary_pixel_count_by_class
         )
@@ -319,21 +308,25 @@ class SemanticCriterion(nn.Module):
         # Multiple prompts belonging to the same original class reuse
         # and independently count the same class boundary.
         # [B, P]
-        distill_pixel_count_by_prompt = (
-            distill_pixel_count_by_class.index_select(
+        mixed_pixel_count_by_prompt = (
+            mixed_pixel_count_by_class.index_select(
                 dim=1,
                 index=prompt_to_class_id,
             )
         )
 
         # Global denominator across the complete prompt space.
-        distill_pixel_denom = int(
+        mixed_pixel_denom = int(
             (
-                distill_pixel_count_by_prompt
+                mixed_pixel_count_by_prompt
                 * presence_target.to(dtype=torch.long)
             )
             .sum()
             .item()
+        )
+
+        gt_mix_ratio, teacher_mix_ratio = self._compute_mix_ratios(
+            train_progress
         )
 
         return SemanticStreamingContext(
@@ -341,17 +334,13 @@ class SemanticCriterion(nn.Module):
             valid_mask=valid_mask,
             prompt_to_class_id=prompt_to_class_id,
             presence_target=presence_target,
-            distill_outer_boundary_by_class=(
-                distill_outer_boundary_by_class
-            ),
+            outer_boundary_by_class=outer_boundary_by_class,
             num_prompt_channels=num_prompt_channels,
             num_label_classes=num_label_classes,
             num_present_pairs=num_present_pairs,
-            distill_pixel_denom=distill_pixel_denom,
-            total_valid_pixels=total_valid_pixels,
-            sam3_mask_distill_weight=float(
-                self.cfg.sam3_mask_distill_weight
-            ),
+            mixed_pixel_denom=mixed_pixel_denom,
+            gt_mix_ratio=gt_mix_ratio,
+            teacher_mix_ratio=teacher_mix_ratio,
         )
 
     def forward_chunk(
@@ -375,7 +364,7 @@ class SemanticCriterion(nn.Module):
                 f"got {tuple(final_logits_chunk.shape)}."
             )
 
-        B, C_chunk = final_logits_chunk.shape[:2]
+        C_chunk = int(final_logits_chunk.shape[1])
         num_prompt_channels = context.num_prompt_channels
 
         if not (
@@ -404,7 +393,6 @@ class SemanticCriterion(nn.Module):
             )
 
         label_map = context.label_map
-        valid_mask = context.valid_mask
         device = final_logits_chunk.device
         dtype = final_logits_chunk.dtype
 
@@ -421,21 +409,6 @@ class SemanticCriterion(nn.Module):
         target_chunk = target_bool.to(dtype=dtype)
 
         zero = self._zero_loss(final_logits_chunk)
-
-        # ---- Plain BCE (every valid pixel equal, global mean) ----
-        bce_per_pixel = F.binary_cross_entropy_with_logits(
-            final_logits_chunk,
-            target_chunk,
-            reduction="none",
-        )  # [B, C_chunk, H, W]
-
-        valid_float = valid_mask.to(
-            device=device, dtype=bce_per_pixel.dtype
-        )[:, None, :, :]  # [B, 1, H, W]
-
-        plain_bce_contribution = (
-            bce_per_pixel * valid_float
-        ).sum() / max(context.total_valid_pixels, 1)
 
         # ---- Dice (optional) ----
         present_mask = context.presence_target[
@@ -458,88 +431,108 @@ class SemanticCriterion(nn.Module):
         else:
             dice_contribution = zero
 
-        # ---- SAM3 teacher distillation ----
-        distill_weight = float(context.sam3_mask_distill_weight)
-        if distill_weight > 0.0 and context.distill_pixel_denom > 0:
-            if OUTPUT_KEYS.sam3_teacher_logits not in outputs:
-                raise ValueError(
-                    "sam3_mask_distill_weight > 0 but "
-                    f"{OUTPUT_KEYS.sam3_teacher_logits!r} is missing."
+        # ---- Dynamic SAM3-teacher / GT mixed BCE ----
+        outer_boundary_chunk = (
+            context.outer_boundary_by_class.index_select(
+                dim=1,
+                index=prompt_class_ids,
+            )
+        )
+        supervision_mask_chunk = (
+            context.valid_mask[:, None, :, :]
+            | outer_boundary_chunk
+        )
+        pair_pixel_mask = (
+            present_mask[:, :, None, None]
+            & supervision_mask_chunk.to(device=device)
+        )
+        chunk_has_present_pair = bool(present_mask.any().item())
+
+        if context.mixed_pixel_denom > 0 and chunk_has_present_pair:
+            teacher_ratio = float(context.teacher_mix_ratio)
+            gt_ratio = float(context.gt_mix_ratio)
+
+            mixed_target = gt_ratio * target_chunk
+            if teacher_ratio > 0.0:
+                teacher_key = OUTPUT_KEYS.sam3_teacher_logits
+                if teacher_key not in outputs:
+                    raise ValueError(
+                        "teacher_mix_ratio > 0 but "
+                        f"{teacher_key!r} is missing."
+                    )
+
+                teacher_logits = outputs[teacher_key]
+                if teacher_logits.shape != final_logits_chunk.shape:
+                    raise ValueError(
+                        "SAM3 teacher logits must match final_logits: "
+                        f"got {tuple(teacher_logits.shape)} and "
+                        f"{tuple(final_logits_chunk.shape)}."
+                    )
+
+                teacher_prob = teacher_logits.detach().sigmoid()
+                mixed_target = (
+                    mixed_target
+                    + teacher_ratio * teacher_prob
                 )
-            chunk_presence_float = present_mask.to(dtype=torch.float32)
 
-            outer_boundary_chunk = (
-                context.distill_outer_boundary_by_class.index_select(
-                    dim=1,
-                    index=prompt_class_ids,
-                )
+            mixed_bce_per_pixel = F.binary_cross_entropy_with_logits(
+                final_logits_chunk,
+                mixed_target,
+                reduction="none",
             )
-
-            # Fixed design:
-            # all valid pixels + class-specific outer ignore boundary.
-            distill_mask_chunk = (
-                context.valid_mask[:, None, :, :]
-                | outer_boundary_chunk
-            )
-
-            distill_contribution = self._distill_contribution_chunk(
-                final_logits=final_logits_chunk,
-                teacher_logits=outputs[
-                    OUTPUT_KEYS.sam3_teacher_logits
-                ],
-                distill_mask_chunk=distill_mask_chunk,
-                presence_target_chunk=chunk_presence_float,
-                global_denom=context.distill_pixel_denom,
-            )
+            mixed_bce_contribution = (
+                mixed_bce_per_pixel
+                * pair_pixel_mask.to(dtype=mixed_bce_per_pixel.dtype)
+            ).sum() / context.mixed_pixel_denom
         else:
-            distill_contribution = zero
+            mixed_bce_contribution = zero
 
-        weighted_distill_contribution = (
-            distill_weight * distill_contribution
+        weighted_mixed_bce_contribution = (
+            float(self.cfg.mixed_bce_weight)
+            * mixed_bce_contribution
         )
 
         # ---- Total ----
         chunk_total = (
-            float(self.cfg.final_balanced_bce_weight) * plain_bce_contribution
+            weighted_mixed_bce_contribution
             + dice_weight * dice_contribution
-            + weighted_distill_contribution
         )
 
         return {
-            "loss_final_bce": plain_bce_contribution,
+            "loss_mixed_bce": mixed_bce_contribution,
+            "loss_mixed_bce_weighted": (
+                weighted_mixed_bce_contribution
+            ),
             "loss_final_dice": dice_contribution,
-            "loss_sam3_mask_distill_bce": distill_contribution,
-            "loss_sam3_mask_distill_weighted": weighted_distill_contribution,
             "total_loss": chunk_total,
         }
 
     # ------------------------------------------------------------------
-    # Distillation (per-chunk, global denominator)
+    # Dynamic target mixture and common supervision region
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_outer_distill_boundary_by_class(
+    def _compute_mix_ratios(
+        train_progress: float,
+    ) -> tuple[float, float]:
+        progress = float(train_progress)
+        if not math.isfinite(progress) or not 0.0 <= progress <= 1.0:
+            raise ValueError(
+                "train_progress must be finite and in [0, 1], "
+                f"got {train_progress!r}."
+            )
+
+        gt_ratio = 0.5 * (1.0 - math.cos(math.pi * progress))
+        teacher_ratio = 1.0 - gt_ratio
+        return gt_ratio, teacher_ratio
+
+    @staticmethod
+    def _build_outer_boundary_by_class(
         class_mask_by_class: torch.Tensor,
         ignore_mask: torch.Tensor,
         boundary_width: int,
     ) -> torch.Tensor:
-        """Build class-specific outer GT boundary bands.
-
-        Args:
-            class_mask_by_class:
-                Boolean tensor [B, M, H, W]. Each channel is
-                the GT mask of one original label class.
-            ignore_mask:
-                Boolean tensor [B, H, W], label == ignore_index.
-            boundary_width:
-                Width of the outer boundary at loss resolution.
-                Zero disables the outer boundary.
-
-        Returns:
-            Boolean tensor [B, M, H, W]. Only ignore pixels
-            within the configured distance from each class mask
-            are True.
-        """
+        """Build class-specific outer GT boundary bands."""
         if boundary_width == 0:
             return torch.zeros_like(
                 class_mask_by_class,
@@ -565,47 +558,6 @@ class SemanticCriterion(nn.Module):
         )
 
         return outer_boundary.contiguous()
-
-    def _distill_contribution_chunk(
-        self,
-        final_logits: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        distill_mask_chunk: torch.Tensor,
-        presence_target_chunk: torch.Tensor,
-        global_denom: int,
-    ) -> torch.Tensor:
-        """Distill present prompts on valid pixels and outer GT boundaries."""
-        teacher_prob = teacher_logits.detach().sigmoid()
-
-        pixel_ce = F.binary_cross_entropy_with_logits(
-            final_logits,
-            teacher_prob,
-            reduction="none",
-        )
-
-        present = presence_target_chunk > 0.5
-
-        if not bool(present.any().item()):
-            return final_logits.sum() * 0.0
-
-        pair_pixel_mask = (
-            present.to(
-                device=pixel_ce.device,
-                dtype=torch.bool,
-            )[:, :, None, None]
-            & distill_mask_chunk.to(
-                device=pixel_ce.device,
-                dtype=torch.bool,
-            )
-        )
-
-        pixel_weight = pair_pixel_mask.to(
-            dtype=pixel_ce.dtype
-        )
-
-        return (
-            pixel_ce * pixel_weight
-        ).sum() / max(int(global_denom), 1)
 
     # ------------------------------------------------------------------
     # Dice (per-chunk, global denominator)
