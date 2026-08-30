@@ -58,7 +58,7 @@ original_encoder_feature_72_chunk
   → original_pixel_feature_288 [B×C_chunk, 256, 288, 288]
 
 original_pixel_feature_288
-  → 冻结的 SAM3 semantic_seg_head（仅当当前 teacher 混合比例 > 0 时执行）
+  → 冻结的 SAM3 semantic_seg_head（仅当蒸馏权重、teacher 比例均 > 0，且 chunk 含存在类别时执行）
   → sam3_teacher_logits
 
 refiner_feature_36_chunk
@@ -145,8 +145,8 @@ SAM3 图像 backbone 在训练中冻结并运行于 `eval()`。图像特征使�
 Pixel Decoder 内部继续使用 `interpolation_mode="nearest"`（SAM3 原始设置）。每次 chunk 只调用一次 Pixel Decoder，且必须在 `torch.no_grad()` 中。Pixel Decoder 参数冻结且保持 `eval()`。
 
 O72/O144/O288 始终用于 Refiner Pyramid Decoder。原始 semantic head
-始终冻结，但仅当当前训练步的 teacher 混合比例大于零且 batch 中存在
-可监督类别时按需运行以产生 teacher logits。训练最后一步不再运行 teacher head。
+始终冻结，但仅当蒸馏权重大于零、当前训练步的 teacher 混合比例大于零，
+且当前 chunk 中存在可蒸馏类别时按需运行以产生 teacher logits。训练最后一步不再运行 teacher head。
 
 ## 4. RemoteCLIP 分支
 
@@ -335,21 +335,25 @@ OpenCLIP 常把 Q/K/V 存在同一个融合参数中。项目对该参数注册�
 
 每个类别通道独立使用 binary mask 监督，不使用跨类别 softmax。
 
-**主损失：动态 SAM3→GT 混合 BCE**（监督 `final_logits`）：
+损失由两条独立路径组成，并分别设置固定总权重。
 
-Final BCE 与 SAM3 蒸馏不再分别计算和设置独立权重。两种目标先在同一监督区域内按训练进度混合，再只执行一次 `binary_cross_entropy_with_logits`。配置只保留一个总权重 `mixed_bce_weight=1.0`。
+**Final BCE**（监督 `final_logits`）保持 `master` 分支语义：
 
-监督对象与区域统一为：
+1. 所有图像—提示对都参与，包括 GT 中不存在的类别。
+2. 只监督全部 `label != 255` 的有效像素，不加入 255 边界环。
+3. 当前提示对应类别为 1，其他有效类别为 0；不存在类别因此仍提供全负目标。
+4. 全局分母为 batch 内有效像素数乘全部提示通道数，不按 chunk 或类别单独平均。
 
-1. 只监督 GT 中存在的图像—提示对；不存在类别的所有提示完全排除，不构造边界环，也不计入分母。
-2. 每个存在提示监督全部 `label != 255` 的有效像素。
-3. 每个存在提示额外监督其原始类别 GT 外侧、且位于 `label == 255` 区域中的边界环。
-4. 外环宽度由 `mixed_bce_boundary_width` 控制，当前为 3；宽度 0 表示只使用有效像素。
-5. 远离目标的其他 255 区域不参与监督。
-6. 多个提示映射到同一原始类别时复用相同外环，但按提示通道独立计入全局分母。
-7. GT 目标在自身类别像素上为 1，在其他有效类别像素和自身外环上为 0。
-8. SAM3 teacher 目标为冻结 semantic head logits 经过 sigmoid 后的软概率，并且必须 detach。
-9. teacher、student 和标签监督区域均为 288×288，不做额外尺度变换。
+**动态 SAM3→GT 蒸馏 BCE**同样监督 `final_logits`，但只作用于 GT 中存在的图像—提示对：
+
+1. 每个存在提示监督全部 `label != 255` 的有效像素。
+2. 每个存在提示额外监督其原始类别 GT 外侧、且位于 `label == 255` 区域中的边界环。
+3. 外环宽度由 `sam3_mask_distill_boundary_width` 控制，当前为 3；宽度 0 表示只使用有效像素。
+4. 不存在类别、远离目标的其他 255 区域均不参与动态蒸馏，也不计入蒸馏分母。
+5. 多个提示映射到同一原始类别时复用相同外环，但按提示通道独立计入全局分母。
+6. GT 目标在自身类别像素上为 1，在其他有效类别像素和自身外环上为 0。
+7. SAM3 teacher 目标为冻结 semantic head logits 经过 sigmoid 后的软概率，并且必须 detach。
+8. teacher、student 和标签监督区域均为 288×288，不做额外尺度变换。
 
 动态比例使用半余弦调度：
 
@@ -374,20 +378,21 @@ mixed_target = gt_ratio × gt_target + teacher_ratio × teacher_probability
 
 因此第一步 `teacher_ratio=1`、`gt_ratio=0`，完全学习 SAM3 分布；最后一步 `teacher_ratio=0`、`gt_ratio=1`，完全学习 GT。半余弦在起点和终点变化更平滑，中点两种目标各占 0.5。恢复训练后使用 checkpoint 中恢复的 `global_iter` 继续同一比例，不会重新从 teacher 比例 1 开始。
 
-由于 GT 与 teacher 使用完全相同的像素掩码和全局分母，先混合标签再计算一次 BCE，与分别计算两次 BCE 后按相同比例相加具有相同的损失值和 student 梯度。当前实现采用前者，避免维护两套损失路径。
+由于动态蒸馏内部的 GT 与 teacher 使用完全相同的像素掩码和全局分母，先混合标签再计算一次 BCE，与分别计算两次 BCE 后按相同比例相加具有相同的损失值和 student 梯度。当前实现采用混合标签后计算一次 BCE。这里的等价性只发生在动态蒸馏内部；Final BCE 仍是另一条独立损失路径。
 
-全局分母是所有存在图像—提示对的“全部有效像素 + 自身外环像素”总数，不按 chunk 单独平均。逐 chunk 返回值相加后与一次性计算完整提示空间严格一致。
+动态蒸馏的全局分母是所有存在图像—提示对的“全部有效像素 + 自身外环像素”总数，不按 chunk 单独平均。两条损失的逐 chunk 返回值分别相加后，都与一次性计算完整提示空间严格一致。
 
 总损失：
 
 ```python
 total_loss = (
-    mixed_bce_weight * loss_mixed_bce
+    final_balanced_bce_weight * loss_final_bce
+    + sam3_mask_distill_weight * loss_sam3_mask_distill_bce
     + final_dice_weight * loss_final_dice
 )
 ```
 
-`mixed_bce_weight` 是动态混合 BCE 的唯一总权重，当前为 1.0。`final_dice_weight` 保持 0.0，Dice 默认关闭；开启时仍只对存在提示计算。
+`final_balanced_bce_weight` 当前为 1.0，`sam3_mask_distill_weight` 当前为 0.5。两者在训练全程固定；动态变化的是蒸馏软标签内部的 teacher/GT 比例。`final_dice_weight` 保持 0.0，Dice 默认关闭；开启时仍只对存在提示计算。
 
 **训练显存设计**：
 
@@ -460,15 +465,16 @@ Ctrl+C 使用 Python 默认 `KeyboardInterrupt`。训练和验证均立即退出
 
 旧格式或缺少完整运行状态的权重不能用于 `--resume-from`，但可以通过 `--load-model-from` 只加载模型参数。
 
-训练日志中记录以下动态混合损失项：
+训练日志中记录以下损失项：
 
 | 键 | 含义 |
 | --- | --- |
-| `loss_mixed_bce` | 混合软标签 BCE 的全局均值（跨 chunk 累加） |
-| `loss_mixed_bce_weighted` | 乘 `mixed_bce_weight` 后加入总损失的贡献 |
-| `mixed_bce_train_progress` | 当前 optimizer step 使用的归一化训练进度 |
-| `mixed_bce_gt_ratio` | 当前 GT 标签混合比例 |
-| `mixed_bce_teacher_ratio` | 当前 SAM3 teacher 混合比例 |
+| `loss_final_bce` | Final BCE 的全局均值（所有提示、全部有效像素） |
+| `loss_sam3_mask_distill_bce` | 动态蒸馏 BCE 的全局均值（仅存在类别） |
+| `loss_sam3_mask_distill_weighted` | 乘 `sam3_mask_distill_weight` 后加入总损失的贡献 |
+| `sam3_mask_distill_train_progress` | 当前 optimizer step 使用的归一化训练进度 |
+| `sam3_mask_distill_gt_ratio` | 当前动态蒸馏中的 GT 标签比例 |
+| `sam3_mask_distill_teacher_ratio` | 当前动态蒸馏中的 SAM3 teacher 比例 |
 
 ## 10. 配置与主要文件
 
@@ -501,7 +507,7 @@ python tools/train.py configs/train/isaid_loveda_full.py
 | `models/score_embeddings.py`          | 64 模板相似度图、归一化 CLIP 融合和空间卷积增强 |
 | `models/openclip_image_encoder.py`    | 36×36 dense RemoteCLIP 图像特征              |
 | `models/openclip_text_encoder.py`     | 模板文本编码、micro-batch 与梯度控制                 |
-| `losses/semantic_criterion.py`        | Streaming 动态 teacher→GT 混合 BCE、公共监督区域和 Dice |
+| `losses/semantic_criterion.py`        | Streaming Final BCE、动态 teacher→GT 蒸馏 BCE、边界区域和 Dice |
 | `engine/trainer.py`                   | 高分辨率逐 chunk loss/backward 与 proxy 梯度回传 |
 | `engine/checkpoint.py`                | 安全、原子、严格的 checkpoint 保存与加载               |
 | `engine/runtime_state.py`             | RNG 捕获与恢复                                |
@@ -529,8 +535,8 @@ python tools/train.py configs/train/isaid_loveda_full.py
 14. 三个 Pixel Decoder 尺度（72/144/288）全部来自同一次 `forward_multiscale` 调用。
 15. O288 同时用于 stage_288 语义支路和 detached teacher。
 16. clip_score_embed_36 保持纯 RemoteCLIP 输出，用于 debug。
-17. teacher 只来自原始 O288 并且必须 detach。teacher 和 student 都为 288×288。仅当当前 teacher 混合比例大于 0 且存在可监督提示时生成 teacher logits。
-18. 动态混合 BCE 只监督存在类别。GT 与 teacher 必须共享完全相同的监督区域和全局分母：全部 GT 有效像素，加上该原始类别 GT 外侧 `mixed_bce_boundary_width` 像素范围内且标签为 255 的边界环。不存在类别和远处 255 区域完全排除。多个提示映射到同一类别时复用相同外环，并在全局分母中按提示独立计数。
+17. teacher 只来自原始 O288 并且必须 detach。teacher 和 student 都为 288×288。仅当蒸馏权重和当前 teacher 混合比例均大于 0，且当前 chunk 存在可蒸馏提示时生成 teacher logits。
+18. Final BCE 保持 `master` 语义：所有提示均在全部 GT 有效像素上监督，不存在类别使用全负目标。动态蒸馏只监督存在类别；其 GT 与 teacher 必须共享完全相同的监督区域和全局分母：全部 GT 有效像素，加上该原始类别 GT 外侧 `sam3_mask_distill_boundary_width` 像素范围内且标签为 255 的边界环。不存在类别和远处 255 区域完全排除。多个提示映射到同一类别时复用相同外环，并在蒸馏全局分母中按提示独立计数。
 19. 最终掩码 logits 由冻结的 SAM3 `semantic_seg_head` 产生。
 20. Refiner 的类间注意力、常规窗口注意力、移位窗口注意力和双流 FFN 均采用 pre-norm，并在末端线性投影后直接执行残差相加，不允许重新引入固定或可学习残差系数。全部 Refiner 层结束后，必须对最终 feature_36 执行一次通道 LayerNorm；最终 score_embed_36 不执行额外输出 LayerNorm。
 21. TTA 必须先平均提示空间分数（`raw_prompt_score_map`），再合并提示到原始类别，最后进行相对阈值过滤。
@@ -580,7 +586,7 @@ Checkpoint schema 版本为 4。实验追踪状态不再保存在 checkpoint 中
 * 新增 `pyramid_decoder.stage_*.detail_refiner_proj.*`（独立细节 Refiner 投影）。
 * 新增 `pyramid_decoder.stage_*.fusion_out_proj.*`（256→256 最终融合 1×1 Conv）。
 * 不复制旧 `refiner_proj` 到两个新投影。
-* 蒸馏损失不再使用余弦衰减，权重在训练全程保持固定。
+* 蒸馏损失的外层权重不再使用余弦衰减，在训练全程保持固定。
 * 配置字段 `sam3_mask_distill_decay_start_iter` 和 `sam3_mask_distill_decay_end_iter` 已删除。
 * `_CHECKPOINT_VERSION` 继续保持 4。
 
@@ -626,12 +632,13 @@ Checkpoint schema 版本为 4。实验追踪状态不再保存在 checkpoint 中
 
 本次动态损失重构：
 
-* 删除配置字段 `final_balanced_bce_weight`、`sam3_mask_distill_weight` 和 `sam3_mask_distill_boundary_width`。
-* 新增 `mixed_bce_weight` 和 `mixed_bce_boundary_width`，不提供旧字段兼容。
-* Final BCE 与 SAM3 蒸馏改为一套动态 teacher→GT 混合 BCE，不再分别计算和加权。
-* 两种目标统一为存在图像—提示对的“全部有效像素 + 自身类别外侧 255 边界环”；不存在类别完全排除。
-* teacher/GT 比例按完整训练进度执行半余弦过渡，第一步为 1/0，最后一步为 0/1。
+* Final BCE 与动态蒸馏恢复为两条独立损失路径，分别由 `final_balanced_bce_weight` 和 `sam3_mask_distill_weight` 设置固定权重。
+* 删除中间设计中的 `mixed_bce_weight` 和 `mixed_bce_boundary_width`，恢复 `sam3_mask_distill_boundary_width`；不提供旧字段兼容。
+* Final BCE 完全保持 `master` 语义：所有提示、全部有效像素，不存在类别提供全负监督。
+* 动态蒸馏只监督存在图像—提示对，范围为“全部有效像素 + 自身类别外侧 255 边界环”。
+* 动态蒸馏内部的 teacher/GT 目标比例按完整训练进度执行半余弦过渡，第一步为 1/0，最后一步为 0/1。
+* 动态蒸馏先混合 GT 和 teacher 软标签、再计算一次 BCE；这与在相同掩码和分母下计算两次 BCE 后按比例相加严格等价。
 * 恢复训练从 checkpoint 的 `global_iter` 继续调度，不重置比例。
-* 删除旧的 Final BCE 和蒸馏加权日志，新增混合 BCE、训练进度及两种目标比例日志。
+* 保留 Final BCE 和蒸馏损失日志，并新增训练进度及两种蒸馏目标比例日志。
 * 模型参数结构和 checkpoint 容器格式均未改变，`_CHECKPOINT_VERSION` 保持为 4。
 * 这是训练语义不兼容变更；新实验必须使用新的 work directory，不应把旧固定损失实验直接作为同一实验恢复。

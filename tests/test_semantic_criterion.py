@@ -30,13 +30,17 @@ OUTPUT_KEYS = import_module(
 ).OUTPUT_KEYS
 
 
-class SemanticCriterionDynamicMixTest(unittest.TestCase):
+class SemanticCriterionDynamicDistillTest(unittest.TestCase):
+    FINAL_WEIGHT = 1.25
+    DISTILL_WEIGHT = 0.4
+
     def setUp(self):
         self.criterion = SemanticCriterion(
             SemanticCriterionConfig(
-                mixed_bce_weight=1.0,
+                final_balanced_bce_weight=self.FINAL_WEIGHT,
                 final_dice_weight=0.0,
-                mixed_bce_boundary_width=1,
+                sam3_mask_distill_weight=self.DISTILL_WEIGHT,
+                sam3_mask_distill_boundary_width=1,
             )
         )
         self.label_map = torch.tensor(
@@ -60,6 +64,23 @@ class SemanticCriterionDynamicMixTest(unittest.TestCase):
             train_progress=progress,
         )
 
+    def _targets_and_distill_mask(self, context, dtype):
+        target = (
+            self.label_map[:, None]
+            == self.prompt_to_class_id[None, :, None, None]
+        ).to(dtype=dtype)
+        prompt_boundaries = (
+            context.distill_outer_boundary_by_class.index_select(
+                1,
+                self.prompt_to_class_id,
+            )
+        )
+        distill_mask = (
+            context.presence_target[:, :, None, None]
+            & (context.valid_mask[:, None] | prompt_boundaries)
+        )
+        return target, distill_mask
+
     def test_cosine_schedule_endpoints_and_midpoint(self):
         self.assertEqual(
             self.criterion._compute_mix_ratios(0.0),
@@ -72,61 +93,62 @@ class SemanticCriterionDynamicMixTest(unittest.TestCase):
         self.assertAlmostEqual(gt_ratio, 1.0)
         self.assertAlmostEqual(teacher_ratio, 0.0)
 
-    def test_absent_prompt_is_excluded_from_mask_denom_and_gradient(self):
+    def test_context_uses_all_prompts_for_final_and_present_for_distill(self):
         context = self._context(0.5)
         self.assertEqual(
             context.presence_target.tolist(),
             [[True, True, False]],
         )
-
-        prompt_boundaries = context.outer_boundary_by_class.index_select(
-            1, self.prompt_to_class_id
+        self.assertEqual(
+            context.total_valid_pixels,
+            int(context.valid_mask.sum().item()) * 3,
         )
-        prompt_masks = context.valid_mask[:, None] | prompt_boundaries
-        expected_denom = int(prompt_masks[:, :2].sum().item())
-        self.assertEqual(context.mixed_pixel_denom, expected_denom)
 
+        _, distill_mask = self._targets_and_distill_mask(
+            context,
+            torch.float32,
+        )
+        self.assertEqual(
+            context.distill_pixel_denom,
+            int(distill_mask.sum().item()),
+        )
+
+    def test_final_bce_keeps_master_scope_and_absent_gradient(self):
+        context = self._context(1.0)
         final_logits = torch.linspace(-1.5, 1.5, 48).reshape(1, 3, 4, 4)
         final_logits.requires_grad_(True)
-        teacher_logits = torch.linspace(1.0, -1.0, 48).reshape(1, 3, 4, 4)
 
         losses = self.criterion.forward_chunk(
-            outputs={
-                OUTPUT_KEYS.final_logits: final_logits,
-                OUTPUT_KEYS.sam3_teacher_logits: teacher_logits,
-            },
+            outputs={OUTPUT_KEYS.final_logits: final_logits},
             context=context,
             class_start=0,
             class_end=3,
         )
 
-        gt_target = (
-            self.label_map[:, None]
-            == self.prompt_to_class_id[None, :, None, None]
-        ).to(dtype=final_logits.dtype)
-        mixed_target = 0.5 * gt_target + 0.5 * teacher_logits.sigmoid()
-        pair_mask = (
-            context.presence_target[:, :, None, None]
-            & prompt_masks
+        target, _ = self._targets_and_distill_mask(
+            context,
+            final_logits.dtype,
         )
-        expected = (
+        expected_final = (
             F.binary_cross_entropy_with_logits(
                 final_logits,
-                mixed_target,
+                target,
                 reduction="none",
             )
-            * pair_mask
-        ).sum() / expected_denom
-
-        torch.testing.assert_close(losses["loss_mixed_bce"], expected)
-
-        losses["total_loss"].backward()
+            * context.valid_mask[:, None]
+        ).sum() / context.total_valid_pixels
         torch.testing.assert_close(
-            final_logits.grad[:, 2],
-            torch.zeros_like(final_logits.grad[:, 2]),
+            losses["loss_final_bce"],
+            expected_final,
         )
 
-    def test_mixed_target_matches_weighted_bces_on_common_mask(self):
+        losses["total_loss"].backward()
+        self.assertGreater(
+            float(final_logits.grad[:, 2].abs().sum().item()),
+            0.0,
+        )
+
+    def test_dynamic_distill_matches_mixed_target_and_two_bces(self):
         context = self._context(0.25)
         final_logits = torch.linspace(-1.0, 1.0, 48).reshape(1, 3, 4, 4)
         teacher_logits = torch.linspace(0.8, -0.8, 48).reshape(1, 3, 4, 4)
@@ -141,40 +163,55 @@ class SemanticCriterionDynamicMixTest(unittest.TestCase):
             class_end=3,
         )
 
-        gt_target = (
-            self.label_map[:, None]
-            == self.prompt_to_class_id[None, :, None, None]
-        ).to(dtype=final_logits.dtype)
-        prompt_boundaries = context.outer_boundary_by_class.index_select(
-            1, self.prompt_to_class_id
+        target, distill_mask = self._targets_and_distill_mask(
+            context,
+            final_logits.dtype,
         )
-        pair_mask = (
-            context.presence_target[:, :, None, None]
-            & (context.valid_mask[:, None] | prompt_boundaries)
-        ).to(dtype=final_logits.dtype)
+        teacher_prob = teacher_logits.sigmoid()
+        mixed_target = (
+            context.gt_mix_ratio * target
+            + context.teacher_mix_ratio * teacher_prob
+        )
+        expected_mixed = (
+            F.binary_cross_entropy_with_logits(
+                final_logits,
+                mixed_target,
+                reduction="none",
+            )
+            * distill_mask
+        ).sum() / context.distill_pixel_denom
 
         gt_bce = (
             F.binary_cross_entropy_with_logits(
                 final_logits,
-                gt_target,
+                target,
                 reduction="none",
             )
-            * pair_mask
-        ).sum() / context.mixed_pixel_denom
+            * distill_mask
+        ).sum() / context.distill_pixel_denom
         teacher_bce = (
             F.binary_cross_entropy_with_logits(
                 final_logits,
-                teacher_logits.sigmoid(),
+                teacher_prob,
                 reduction="none",
             )
-            * pair_mask
-        ).sum() / context.mixed_pixel_denom
-        expected = (
+            * distill_mask
+        ).sum() / context.distill_pixel_denom
+        expected_two_bces = (
             context.gt_mix_ratio * gt_bce
             + context.teacher_mix_ratio * teacher_bce
         )
 
-        torch.testing.assert_close(losses["loss_mixed_bce"], expected)
+        torch.testing.assert_close(
+            losses["loss_sam3_mask_distill_bce"],
+            expected_mixed,
+        )
+        torch.testing.assert_close(expected_mixed, expected_two_bces)
+        torch.testing.assert_close(
+            losses["total_loss"],
+            self.FINAL_WEIGHT * losses["loss_final_bce"]
+            + self.DISTILL_WEIGHT * expected_mixed,
+        )
 
     def test_final_step_uses_gt_without_teacher_logits(self):
         context = self._context(1.0)
@@ -191,7 +228,7 @@ class SemanticCriterionDynamicMixTest(unittest.TestCase):
         losses["total_loss"].backward()
         self.assertIsNotNone(final_logits.grad)
 
-    def test_absent_only_chunk_does_not_require_teacher_logits(self):
+    def test_absent_only_chunk_has_final_bce_but_no_distill(self):
         context = self._context(0.0)
         final_logits = torch.zeros((1, 1, 4, 4), requires_grad=True)
 
@@ -202,12 +239,29 @@ class SemanticCriterionDynamicMixTest(unittest.TestCase):
             class_end=3,
         )
 
-        self.assertEqual(float(losses["total_loss"].item()), 0.0)
-        losses["total_loss"].backward()
-        torch.testing.assert_close(
-            final_logits.grad,
-            torch.zeros_like(final_logits.grad),
+        self.assertGreater(float(losses["loss_final_bce"].item()), 0.0)
+        self.assertEqual(
+            float(losses["loss_sam3_mask_distill_bce"].item()),
+            0.0,
         )
+        torch.testing.assert_close(
+            losses["total_loss"],
+            self.FINAL_WEIGHT * losses["loss_final_bce"],
+        )
+        losses["total_loss"].backward()
+        self.assertGreater(float(final_logits.grad.abs().sum().item()), 0.0)
+
+    def test_present_chunk_requires_teacher_before_final_step(self):
+        context = self._context(0.0)
+        final_logits = torch.zeros((1, 2, 4, 4), requires_grad=True)
+
+        with self.assertRaisesRegex(ValueError, "teacher_mix_ratio"):
+            self.criterion.forward_chunk(
+                outputs={OUTPUT_KEYS.final_logits: final_logits},
+                context=context,
+                class_start=0,
+                class_end=2,
+            )
 
 
 if __name__ == "__main__":

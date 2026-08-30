@@ -33,7 +33,7 @@ class SemanticStreamingContext:
     # [B, M, H, W] bool.
     # M is the number of original label classes.
     # Only contains class-specific outer boundaries in ignore pixels.
-    outer_boundary_by_class: torch.Tensor
+    distill_outer_boundary_by_class: torch.Tensor
 
     num_prompt_channels: int
     num_label_classes: int
@@ -41,8 +41,13 @@ class SemanticStreamingContext:
     # Number of present image-prompt pairs.
     num_present_pairs: int
 
-    # Total selected pixels across all present image-prompt pairs.
-    mixed_pixel_denom: int
+    # Total selected distillation pixels across all present prompts.
+    distill_pixel_denom: int
+
+    # Number of valid pixels multiplied by P.
+    total_valid_pixels: int
+
+    sam3_mask_distill_weight: float
 
     # Cosine-scheduled target mixture for the current optimizer step.
     gt_mix_ratio: float
@@ -52,11 +57,13 @@ class SemanticStreamingContext:
 class SemanticCriterion(nn.Module):
     """Semantic segmentation criterion with streaming per-chunk support.
 
-    The main loss is one BCE over a cosine-scheduled mixture of the frozen
-    SAM3 teacher probability and the binary GT target. Only image-prompt
-    pairs whose original class is present are supervised. GT and teacher use
-    the exact same pixels: all valid GT pixels plus the class-specific outer
-    boundary restricted to ignore pixels.
+    Final BCE keeps the master-branch behavior: all prompt channels are
+    supervised on every valid pixel, including prompts for absent classes.
+
+    Dynamic distillation only supervises present image-prompt pairs. Its
+    target transitions from the frozen SAM3 probability to binary GT with a
+    half-cosine schedule. Both target components use the same pixels: all
+    valid GT pixels plus the class-specific outer boundary in ignore pixels.
 
     Dice remains optional and disabled by default.
     """
@@ -65,28 +72,39 @@ class SemanticCriterion(nn.Module):
         super().__init__()
         self.cfg = cfg or SemanticCriterionConfig()
 
-        mixed_bce_weight = float(self.cfg.mixed_bce_weight)
-        if mixed_bce_weight < 0.0:
+        final_bce_weight = float(
+            self.cfg.final_balanced_bce_weight
+        )
+        if final_bce_weight < 0.0:
             raise ValueError(
-                "mixed_bce_weight must be >= 0, "
-                f"got {mixed_bce_weight}."
+                "final_balanced_bce_weight must be >= 0, "
+                f"got {final_bce_weight}."
             )
 
-        boundary_width = self.cfg.mixed_bce_boundary_width
+        distill_weight = float(self.cfg.sam3_mask_distill_weight)
+        if distill_weight < 0.0:
+            raise ValueError(
+                "sam3_mask_distill_weight must be >= 0, "
+                f"got {distill_weight}."
+            )
+
+        boundary_width = (
+            self.cfg.sam3_mask_distill_boundary_width
+        )
 
         if (
             isinstance(boundary_width, bool)
             or not isinstance(boundary_width, int)
         ):
             raise TypeError(
-                "mixed_bce_boundary_width must be "
+                "sam3_mask_distill_boundary_width must be "
                 "a non-negative integer, "
                 f"got {boundary_width!r}."
             )
 
         if boundary_width < 0:
             raise ValueError(
-                "mixed_bce_boundary_width must be >= 0, "
+                "sam3_mask_distill_boundary_width must be >= 0, "
                 f"got {boundary_width}."
             )
 
@@ -239,6 +257,11 @@ class SemanticCriterion(nn.Module):
                     f"max={max_label}."
                 )
 
+        total_valid_pixels = (
+            int(valid_mask.sum().item())
+            * num_prompt_channels
+        )
+
         class_ids = torch.arange(
             num_label_classes,
             device=label_map.device,
@@ -268,10 +291,12 @@ class SemanticCriterion(nn.Module):
             presence_target.sum().item()
         )
 
-        boundary_width = int(self.cfg.mixed_bce_boundary_width)
+        boundary_width = int(
+            self.cfg.sam3_mask_distill_boundary_width
+        )
 
         # [B, M, H, W]
-        outer_boundary_by_class = (
+        distill_outer_boundary_by_class = (
             self._build_outer_boundary_by_class(
                 class_mask_by_class=class_mask_by_class,
                 ignore_mask=ignore_mask,
@@ -291,7 +316,7 @@ class SemanticCriterion(nn.Module):
         # Each original class additionally owns its own outer boundary.
         # [B, M]
         outer_boundary_pixel_count_by_class = (
-            outer_boundary_by_class
+            distill_outer_boundary_by_class
             .to(dtype=torch.long)
             .flatten(2)
             .sum(dim=2)
@@ -300,7 +325,7 @@ class SemanticCriterion(nn.Module):
         # Valid pixels and outer boundaries are disjoint because the
         # outer boundary is restricted to ignore_mask.
         # [B, M]
-        mixed_pixel_count_by_class = (
+        distill_pixel_count_by_class = (
             valid_pixel_count[:, None]
             + outer_boundary_pixel_count_by_class
         )
@@ -308,17 +333,17 @@ class SemanticCriterion(nn.Module):
         # Multiple prompts belonging to the same original class reuse
         # and independently count the same class boundary.
         # [B, P]
-        mixed_pixel_count_by_prompt = (
-            mixed_pixel_count_by_class.index_select(
+        distill_pixel_count_by_prompt = (
+            distill_pixel_count_by_class.index_select(
                 dim=1,
                 index=prompt_to_class_id,
             )
         )
 
         # Global denominator across the complete prompt space.
-        mixed_pixel_denom = int(
+        distill_pixel_denom = int(
             (
-                mixed_pixel_count_by_prompt
+                distill_pixel_count_by_prompt
                 * presence_target.to(dtype=torch.long)
             )
             .sum()
@@ -334,11 +359,17 @@ class SemanticCriterion(nn.Module):
             valid_mask=valid_mask,
             prompt_to_class_id=prompt_to_class_id,
             presence_target=presence_target,
-            outer_boundary_by_class=outer_boundary_by_class,
+            distill_outer_boundary_by_class=(
+                distill_outer_boundary_by_class
+            ),
             num_prompt_channels=num_prompt_channels,
             num_label_classes=num_label_classes,
             num_present_pairs=num_present_pairs,
-            mixed_pixel_denom=mixed_pixel_denom,
+            distill_pixel_denom=distill_pixel_denom,
+            total_valid_pixels=total_valid_pixels,
+            sam3_mask_distill_weight=float(
+                self.cfg.sam3_mask_distill_weight
+            ),
             gt_mix_ratio=gt_mix_ratio,
             teacher_mix_ratio=teacher_mix_ratio,
         )
@@ -410,6 +441,20 @@ class SemanticCriterion(nn.Module):
 
         zero = self._zero_loss(final_logits_chunk)
 
+        # ---- Final BCE (master behavior: all prompts, valid pixels) ----
+        bce_per_pixel = F.binary_cross_entropy_with_logits(
+            final_logits_chunk,
+            target_chunk,
+            reduction="none",
+        )
+        valid_float = context.valid_mask.to(
+            device=device,
+            dtype=bce_per_pixel.dtype,
+        )[:, None, :, :]
+        final_bce_contribution = (
+            bce_per_pixel * valid_float
+        ).sum() / max(context.total_valid_pixels, 1)
+
         # ---- Dice (optional) ----
         present_mask = context.presence_target[
             :, class_start:class_end
@@ -431,9 +476,9 @@ class SemanticCriterion(nn.Module):
         else:
             dice_contribution = zero
 
-        # ---- Dynamic SAM3-teacher / GT mixed BCE ----
+        # ---- Dynamic SAM3-teacher / GT distillation BCE ----
         outer_boundary_chunk = (
-            context.outer_boundary_by_class.index_select(
+            context.distill_outer_boundary_by_class.index_select(
                 dim=1,
                 index=prompt_class_ids,
             )
@@ -447,8 +492,13 @@ class SemanticCriterion(nn.Module):
             & supervision_mask_chunk.to(device=device)
         )
         chunk_has_present_pair = bool(present_mask.any().item())
+        distill_weight = float(context.sam3_mask_distill_weight)
 
-        if context.mixed_pixel_denom > 0 and chunk_has_present_pair:
+        if (
+            distill_weight > 0.0
+            and context.distill_pixel_denom > 0
+            and chunk_has_present_pair
+        ):
             teacher_ratio = float(context.teacher_mix_ratio)
             gt_ratio = float(context.gt_mix_ratio)
 
@@ -475,35 +525,37 @@ class SemanticCriterion(nn.Module):
                     + teacher_ratio * teacher_prob
                 )
 
-            mixed_bce_per_pixel = F.binary_cross_entropy_with_logits(
+            distill_bce_per_pixel = F.binary_cross_entropy_with_logits(
                 final_logits_chunk,
                 mixed_target,
                 reduction="none",
             )
-            mixed_bce_contribution = (
-                mixed_bce_per_pixel
-                * pair_pixel_mask.to(dtype=mixed_bce_per_pixel.dtype)
-            ).sum() / context.mixed_pixel_denom
+            distill_contribution = (
+                distill_bce_per_pixel
+                * pair_pixel_mask.to(dtype=distill_bce_per_pixel.dtype)
+            ).sum() / context.distill_pixel_denom
         else:
-            mixed_bce_contribution = zero
+            distill_contribution = zero
 
-        weighted_mixed_bce_contribution = (
-            float(self.cfg.mixed_bce_weight)
-            * mixed_bce_contribution
+        weighted_distill_contribution = (
+            distill_weight * distill_contribution
         )
 
         # ---- Total ----
         chunk_total = (
-            weighted_mixed_bce_contribution
+            float(self.cfg.final_balanced_bce_weight)
+            * final_bce_contribution
             + dice_weight * dice_contribution
+            + weighted_distill_contribution
         )
 
         return {
-            "loss_mixed_bce": mixed_bce_contribution,
-            "loss_mixed_bce_weighted": (
-                weighted_mixed_bce_contribution
-            ),
+            "loss_final_bce": final_bce_contribution,
             "loss_final_dice": dice_contribution,
+            "loss_sam3_mask_distill_bce": distill_contribution,
+            "loss_sam3_mask_distill_weighted": (
+                weighted_distill_contribution
+            ),
             "total_loss": chunk_total,
         }
 

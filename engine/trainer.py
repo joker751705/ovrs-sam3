@@ -289,8 +289,9 @@ class Trainer:
             )
 
         need_teacher_logits = (
-            loss_context.teacher_mix_ratio > 0.0
-            and loss_context.mixed_pixel_denom > 0
+            loss_context.sam3_mask_distill_weight > 0.0
+            and loss_context.teacher_mix_ratio > 0.0
+            and loss_context.distill_pixel_denom > 0
         )
 
         chunk_class_counts = encoder_refiner_cache["chunk_class_counts"]
@@ -340,9 +341,10 @@ class Trainer:
 
             # Accumulate detached stats on GPU.
             for key in (
-                "loss_mixed_bce",
-                "loss_mixed_bce_weighted",
+                "loss_final_bce",
                 "loss_final_dice",
+                "loss_sam3_mask_distill_bce",
+                "loss_sam3_mask_distill_weighted",
                 "total_loss",
             ):
                 val = chunk_loss_dict.get(key)
@@ -364,13 +366,13 @@ class Trainer:
                 f"expected C_total={C_total}."
             )
 
-        accum["mixed_bce_train_progress"] = (
+        accum["sam3_mask_distill_train_progress"] = (
             refiner_features_36.new_tensor(train_progress)
         )
-        accum["mixed_bce_gt_ratio"] = (
+        accum["sam3_mask_distill_gt_ratio"] = (
             refiner_features_36.new_tensor(loss_context.gt_mix_ratio)
         )
-        accum["mixed_bce_teacher_ratio"] = (
+        accum["sam3_mask_distill_teacher_ratio"] = (
             refiner_features_36.new_tensor(
                 loss_context.teacher_mix_ratio
             )
